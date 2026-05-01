@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Library Auto Renew</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        margin: 0;
+        padding: 12px;
+        width: 320px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        font-weight: 650;
+      }
+      .notice {
+        font-size: 11px;
+        line-height: 1.45;
+        padding: 10px;
+        margin: 0 0 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(216, 59, 1, 0.45);
+        background: rgba(216, 59, 1, 0.08);
+      }
+      .notice strong {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 12px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        margin: 10px 0 6px;
+        opacity: 0.9;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid rgba(127, 127, 127, 0.35);
+        background: transparent;
+      }
+      button {
+        width: 100%;
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 0;
+        cursor: pointer;
+        font-weight: 650;
+      }
+      #start {
+        background: #2b6cff;
+        color: white;
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 12px;
+        opacity: 0.85;
+        min-height: 16px;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Library Auto Renew</h1>
+
+    <div class="notice" role="alert">
+      <strong>Password required</strong>
+      This extension needs your library password to log in and renew loans on your behalf.
+      Your password is stored only on this device in the extension’s local storage.
+      The extension does not upload your password to any developer or third-party server; signing in happens through HKPL pages in your browser, similar to typing it yourself.
+    </div>
+
+    <div id="accounts"></div>
+
+    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(127,127,127,0.25);">
+      <label for="newAccount">Add account</label>
+      <input id="newAccount" type="text" autocomplete="off" placeholder="Account" />
+
+      <label for="newPassword">Password</label>
+      <input id="newPassword" type="password" autocomplete="off" placeholder="Password" />
+
+      <button id="add" type="button">Add</button>
+    </div>
+
+    <button id="start" type="button">Start all</button>
+    <div id="status" aria-live="polite"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

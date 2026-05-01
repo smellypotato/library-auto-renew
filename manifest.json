@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "Library Auto Renew",
+  "version": "1.0.0",
+  "description": "Logs into Hong Kong Public Library (HKPL) WebCat in your browser and renews loans due today. Supports multiple saved accounts and optional daily reminders.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["storage", "tabs", "alarms"],
+  "host_permissions": ["https://www.hkpl.gov.hk/*", "https://webcat.hkpl.gov.hk/*"],
+  "action": {
+    "default_title": "Library Auto Renew",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.hkpl.gov.hk/*/login.html*"],
+      "js": ["login-autofill-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.hkpl.gov.hk/*/confirm_logout.html*"],
+      "js": ["hkpl-confirm-logout-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.hkpl.gov.hk/*/logout.html*"],
+      "js": ["hkpl-logout-done-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://webcat.hkpl.gov.hk/search/query*"],
+      "js": ["webcat-go-account-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://webcat.hkpl.gov.hk/*"],
+      "exclude_matches": ["https://webcat.hkpl.gov.hk/search/query*"],
+      "js": ["webcat-logout-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://webcat.hkpl.gov.hk/wicket/bookmarkable/com.vtls.chamo.webapp.component.patron.PatronAccountPage*"
+      ],
+      "js": ["patron-checkall-content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
+
