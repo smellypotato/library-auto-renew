@@ -40,6 +40,27 @@
     return `${yyyy}-${mm}-${dd}`;
   }
 
+  /**
+   * When there are no borrowed items, HKPL still renders `table#checkout` with
+   * `.norecords-tr` / `.norecords-td` (e.g. 沒有借出項目) and no renewal checkboxes.
+   * Without this, `total` stays 0 until the phase poll times out.
+   */
+  function patronCheckoutLoansReadyState() {
+    const checkout = document.querySelector("table#checkout");
+    if (!checkout) return { ready: false, emptyLoans: false };
+
+    const checkboxes = checkout.querySelectorAll(
+      "input[type='checkbox'][name='renewalCheckboxGroup']",
+    );
+    if (checkboxes.length > 0) return { ready: true, emptyLoans: false };
+
+    if (checkout.querySelector("tr.norecords-tr, td.norecords-td")) {
+      return { ready: true, emptyLoans: true };
+    }
+
+    return { ready: false, emptyLoans: false };
+  }
+
   function checkDueTodayOnly() {
     const today = formatYyyyMmDd(new Date());
 
@@ -70,13 +91,18 @@
     patronPollAttempts += 1;
 
     const { total, checkedNow, today } = checkDueTodayOnly();
+    const checkoutState = patronCheckoutLoansReadyState();
 
-    if (total > 0 || patronPollAttempts >= PHASE_POLL_MAX_ATTEMPTS) {
+    if (
+      total > 0 ||
+      checkoutState.ready ||
+      patronPollAttempts >= PHASE_POLL_MAX_ATTEMPTS
+    ) {
       clearInterval(timer);
 
       if (patronPollAttempts >= PHASE_POLL_MAX_ATTEMPTS && total === 0) {
-        const hasTable = !!document.querySelector("table");
-        if (!hasTable) {
+        const hasCheckout = !!document.querySelector("table#checkout");
+        if (!hasCheckout) {
           reportPatronPhaseFailed(
             "Cannot find borrowed items table or renewal checklist (timed out).",
           );
