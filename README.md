@@ -83,7 +83,7 @@ If you publish a **direct download** link in this README (see Step 1), **commit 
 
 ## Updating
 
-Download a **fresh ZIP** (use the **[direct link](dist/library-auto-renew-v1.0.0.zip)** in Step 1 if it matches the latest release, or repeat Step 1), extract it over your old folder or into a new folder, then on `chrome://extensions` or `edge://extensions` click **Reload** on **Library Auto Renew**. If you used a new folder, use **Remove** on the old extension entry and **Load unpacked** again on the new folder.
+Download a **fresh ZIP** (use the **[direct link](dist/library-auto-renew.zip)** in Step 1 if it matches the latest release, or repeat Step 1), extract it over your old folder or into a new folder, then on `chrome://extensions` or `edge://extensions` click **Reload** on **Library Auto Renew**. If you used a new folder, use **Remove** on the old extension entry and **Load unpacked** again on the new folder.
 
 Your saved accounts usually stay as long as you do not remove the extension or clear extension data. If you use Git instead, you can pull the latest changes and reload the extension the same way.
 
