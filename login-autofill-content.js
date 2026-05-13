@@ -2,6 +2,9 @@
   if (globalThis.__libraryAutoRenew_loginAutofillRan) return;
   globalThis.__libraryAutoRenew_loginAutofillRan = true;
 
+  /** Per-tab / per-page load only. Global storage caused stray login tabs to skip submit. */
+  let didAutoSubmitLogin = false;
+
   /** Keep in sync with PHASE_PAGE_TIMEOUT_MS in background.js */
   const PHASE_PAGE_TIMEOUT_MS = 30000;
   const PHASE_POLL_INTERVAL_MS = 250;
@@ -59,11 +62,13 @@
       document.querySelector("button[type='submit']") ||
       document.querySelector("form#login button");
 
-    const { didAutoClickLogin } = await chrome.storage.local.get([
-      "didAutoClickLogin",
-    ]);
-    if (!didAutoClickLogin && accountEl && passwordEl && submitButton) {
-      await chrome.storage.local.set({ didAutoClickLogin: true });
+    if (
+      !didAutoSubmitLogin &&
+      accountEl &&
+      passwordEl &&
+      submitButton
+    ) {
+      didAutoSubmitLogin = true;
       submitButton.click();
     }
   }
@@ -85,16 +90,13 @@
       clearInterval(timer);
 
       if (loginAutofillPollAttempts >= PHASE_POLL_MAX_ATTEMPTS) {
-        const { didAutoClickLogin } = await chrome.storage.local.get([
-          "didAutoClickLogin",
-        ]);
         if (!hasAccount || !hasPassword) {
           reportLoginPhaseFailed(
             "Cannot find HKPL login username/password fields (timed out).",
           );
           return;
         }
-        if (!didAutoClickLogin) {
+        if (!didAutoSubmitLogin) {
           reportLoginPhaseFailed(
             "Login form found but could not submit (timed out or blocked).",
           );

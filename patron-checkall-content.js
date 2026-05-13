@@ -40,6 +40,55 @@
     return `${yyyy}-${mm}-${dd}`;
   }
 
+  const DUE_YYYY_MM_DD = /\b(\d{4}-\d{2}-\d{2})\b/;
+
+  function isTrVisiblyHidden(tr) {
+    if (!tr) return true;
+    if (tr.style?.display === "none") return true;
+    const st = tr.getAttribute("style");
+    if (st && /display\s*:\s*none/i.test(st)) return true;
+    return false;
+  }
+
+  /** Due date cell is usually column 5; whole-row match covers shifted layouts. */
+  function dueYyyyMmDdFromLoanRow(tr, checkbox) {
+    const rowText = tr.textContent ?? "";
+    const fromRow = rowText.match(DUE_YYYY_MM_DD);
+    if (fromRow) return fromRow[1];
+    if (!checkbox) return "";
+    const tds = tr.querySelectorAll("td");
+    const col = (tds[4]?.textContent ?? "").trim().match(DUE_YYYY_MM_DD);
+    return col ? col[1] : "";
+  }
+
+  /**
+   * One pass over `#checkout` tbody: each visible loan row with a due date and/or
+   * renewal checkbox. Rows without a checkbox (e.g. 今天無需續借) still count for
+   * “page loaded” / display-only; only rows with a checkbox contribute to `total`
+   * and can be ticked for submit.
+   */
+  function getCheckoutLoanRows(checkout) {
+    const tbody = checkout.querySelector("tbody");
+    if (!tbody) return [];
+
+    const out = [];
+    for (const tr of tbody.querySelectorAll("tr")) {
+      if (isTrVisiblyHidden(tr)) continue;
+      if (tr.classList.contains("norecords-tr")) continue;
+      const tds = tr.querySelectorAll("td");
+      if (tds.length < 3) continue;
+
+      const checkbox = tr.querySelector(
+        "input[type='checkbox'][name='renewalCheckboxGroup']",
+      );
+      const due = dueYyyyMmDdFromLoanRow(tr, checkbox);
+      if (!checkbox && !due) continue;
+
+      out.push({ tr, checkbox, due });
+    }
+    return out;
+  }
+
   /**
    * When there are no borrowed items, HKPL still renders `table#checkout` with
    * `.norecords-tr` / `.norecords-td` (e.g. 沒有借出項目) and no renewal checkboxes.
@@ -47,43 +96,67 @@
    */
   function patronCheckoutLoansReadyState() {
     const checkout = document.querySelector("table#checkout");
-    if (!checkout) return { ready: false, emptyLoans: false };
-
-    const checkboxes = checkout.querySelectorAll(
-      "input[type='checkbox'][name='renewalCheckboxGroup']",
-    );
-    if (checkboxes.length > 0) return { ready: true, emptyLoans: false };
-
-    if (checkout.querySelector("tr.norecords-tr, td.norecords-td")) {
-      return { ready: true, emptyLoans: true };
+    if (!checkout) {
+      return {
+        ready: false,
+        emptyLoans: false,
+        displayOnlyLoanRows: false,
+      };
     }
 
-    return { ready: false, emptyLoans: false };
+    const loanRows = getCheckoutLoanRows(checkout);
+    const checkboxCount = loanRows.filter((r) => r.checkbox).length;
+
+    if (checkboxCount > 0) {
+      return {
+        ready: true,
+        emptyLoans: false,
+        displayOnlyLoanRows: false,
+      };
+    }
+
+    if (checkout.querySelector("tr.norecords-tr, td.norecords-td")) {
+      return {
+        ready: true,
+        emptyLoans: true,
+        displayOnlyLoanRows: false,
+      };
+    }
+
+    const displayOnly =
+      loanRows.length > 0 && loanRows.every((r) => !r.checkbox);
+    if (displayOnly) {
+      return {
+        ready: true,
+        emptyLoans: false,
+        displayOnlyLoanRows: true,
+      };
+    }
+
+    return {
+      ready: false,
+      emptyLoans: false,
+      displayOnlyLoanRows: false,
+    };
   }
 
   function checkDueTodayOnly() {
     const today = formatYyyyMmDd(new Date());
-
-    const checkboxes = Array.from(
-      document.querySelectorAll(
-        "input[type='checkbox'][name='renewalCheckboxGroup']",
-      ),
-    );
+    const checkout = document.querySelector("table#checkout");
+    const loanRows = checkout ? getCheckoutLoanRows(checkout) : [];
 
     let checkedNow = 0;
-    for (const cb of checkboxes) {
-      const tr = cb.closest("tr");
-      const tds = tr ? Array.from(tr.querySelectorAll("td")) : [];
-      const dueText = (tds[4]?.textContent ?? "").trim();
-
-      if (dueText === today && !cb.checked) {
-        setNativeChecked(cb, true);
-        dispatchInputEvents(cb);
+    for (const { checkbox, due } of loanRows) {
+      if (!checkbox) continue;
+      if (due === today && !checkbox.checked) {
+        setNativeChecked(checkbox, true);
+        dispatchInputEvents(checkbox);
         checkedNow += 1;
       }
     }
 
-    return { total: checkboxes.length, checkedNow, today };
+    const total = loanRows.filter((r) => r.checkbox).length;
+    return { total, checkedNow, today };
   }
 
   let patronPollAttempts = 0;
@@ -125,6 +198,7 @@
         checkedNow,
         today,
         didClickRenew,
+        displayOnlyLoanRows: !!checkoutState.displayOnlyLoanRows,
         url: location.href,
       });
 

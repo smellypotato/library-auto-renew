@@ -152,7 +152,6 @@ async function computeAndSetBadge() {
 
 async function resetFlowFlagsForAccountRun() {
   await setState({
-    didAutoClickLogin: false,
     shouldLogout: false,
     didClickLogout: false,
     didConfirmLogout: false,
@@ -167,23 +166,44 @@ async function resetFlowFlagsForAccountRun() {
   });
 }
 
-async function ensureRunnerTab() {
-  const { runnerTabId = null } = await getState(["runnerTabId"]);
-  if (typeof runnerTabId === "number") {
-    const tab = await chrome.tabs.get(runnerTabId).catch(() => null);
-    if (tab) return runnerTabId;
-  }
+/** Serialize tab creation so concurrent auto-run / queue starts never open duplicate login tabs. */
+let ensureRunnerTabChain = Promise.resolve();
 
-  const tab = await chrome.tabs.create({ url: LOGIN_URL, active: false });
-  const newTabId = tab?.id ?? null;
-  if (typeof newTabId === "number") {
-    await setState({ runnerTabId: newTabId });
-    return newTabId;
-  }
-  return null;
+async function ensureRunnerTab() {
+  const p = ensureRunnerTabChain.then(async () => {
+    const { runnerTabId = null } = await getState(["runnerTabId"]);
+    if (typeof runnerTabId === "number") {
+      const tab = await chrome.tabs.get(runnerTabId).catch(() => null);
+      if (tab) return runnerTabId;
+    }
+
+    const tab = await chrome.tabs.create({ url: LOGIN_URL, active: false });
+    const newTabId = tab?.id ?? null;
+    if (typeof newTabId === "number") {
+      await setState({ runnerTabId: newTabId });
+      return newTabId;
+    }
+    return null;
+  });
+  ensureRunnerTabChain = p.catch(() => {});
+  return p;
 }
 
+/**
+ * Serialize queue steps so two callers never overlap on flags + runner tab
+ * (e.g. LOGOUT_DONE advancing the queue vs a duplicate RUN_ALL).
+ */
+let startNextAccountIfAnyChain = Promise.resolve();
+
 async function startNextAccountIfAny() {
+  const p = startNextAccountIfAnyChain.then(() =>
+    startNextAccountIfAnyImpl().catch(() => {}),
+  );
+  startNextAccountIfAnyChain = p.catch(() => {});
+  return p;
+}
+
+async function startNextAccountIfAnyImpl() {
   const {
     runningAll = false,
     accounts = [],
@@ -269,7 +289,26 @@ async function startNextAccountIfAny() {
   });
 }
 
+let runSingleAccountChain = Promise.resolve();
+
 async function runSingleAccountById(id) {
+  const p = runSingleAccountChain.then(() =>
+    runSingleAccountByIdImpl(id).catch(() => false),
+  );
+  runSingleAccountChain = p.catch(() => {});
+  return p;
+}
+
+async function runSingleAccountByIdImpl(id) {
+  const { runningAll = false, runningOne = false } = await getState([
+    "runningAll",
+    "runningOne",
+  ]);
+  if (runningAll || runningOne) {
+    await setState({ runError: "Another run is already in progress." });
+    return false;
+  }
+
   const { accounts = [] } = await getState(["accounts"]);
   const acct = accounts.find((a) => a.id === id);
   if (!acct) {
@@ -413,7 +452,17 @@ async function failRunAndLogout(tabId, runError, runDetails) {
     .catch(() => {});
 }
 
+/** Serialize so onStartup, onInstalled, and calendar alarm cannot start two runs in parallel. */
+let maybeAutoRunTodayChain = Promise.resolve();
+
 async function maybeAutoRunToday() {
+  maybeAutoRunTodayChain = maybeAutoRunTodayChain.then(() =>
+    maybeAutoRunTodayCore().catch(() => {}),
+  );
+  return maybeAutoRunTodayChain;
+}
+
+async function maybeAutoRunTodayCore() {
   const {
     lastAutoRunDate = null,
     runningAll = false,
@@ -472,10 +521,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const total = message.total ?? 0;
           const today = message.today ?? null;
           const didClickRenew = !!message.didClickRenew;
+          const displayOnlyLoanRows = !!message.displayOnlyLoanRows;
 
           if (total === 0 || checkedNow === 0) {
             const details =
-              total === 0
+              total === 0 && !displayOnlyLoanRows
                 ? "Success: no borrowed items found."
                 : today
                   ? `Success: no items due today (${today}).`
@@ -618,7 +668,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case "RUN_ALL": {
-          const { accounts = [] } = await getState(["accounts"]);
+          const {
+            accounts = [],
+            runningAll = false,
+            runningOne = false,
+          } = await getState(["accounts", "runningAll", "runningOne"]);
+          if (runningAll || runningOne) {
+            sendResponse({
+              ok: false,
+              error: "Already running. Wait for the current run to finish.",
+            });
+            break;
+          }
           if (!accounts.length) {
             await setState({ runError: "No accounts configured." });
             sendResponse({ ok: false, error: "No accounts configured." });
@@ -662,34 +723,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "START_LOGIN": {
           await resetFlowFlagsForAccountRun();
           const runStartedAt = Date.now();
-
-          chrome.tabs.create({ url: LOGIN_URL }, async (tab) => {
-            if (chrome.runtime.lastError) {
-              sendResponse({
-                ok: false,
-                error: chrome.runtime.lastError.message,
-              });
-              return;
-            }
-            const tabId = tab?.id ?? null;
-            if (typeof tabId !== "number") {
-              sendResponse({ ok: false, error: "Could not open login tab." });
-              return;
-            }
-            await setRunState({
-              runState: "running",
-              runError: null,
-              runTabId: tabId,
-              runStartedAt,
-              runFinishedAt: null,
-            });
-
-            chrome.alarms.create(`flowTimeout:${tabId}`, {
-              when: Date.now() + FLOW_TIMEOUT_MS,
-            });
-
-            sendResponse({ ok: true, tabId, url: LOGIN_URL });
+          const tabId = await ensureRunnerTab();
+          if (typeof tabId !== "number") {
+            sendResponse({ ok: false, error: "Could not open login tab." });
+            break;
+          }
+          await chrome.tabs
+            .update(tabId, { url: LOGIN_URL, active: false })
+            .catch(() => {});
+          await setRunState({
+            runState: "running",
+            runError: null,
+            runTabId: tabId,
+            runStartedAt,
+            runFinishedAt: null,
           });
+          chrome.alarms.clear(`flowTimeout:${tabId}`).catch(() => {});
+          chrome.alarms.create(`flowTimeout:${tabId}`, {
+            when: Date.now() + FLOW_TIMEOUT_MS,
+          });
+          sendResponse({ ok: true, tabId, url: LOGIN_URL });
           break;
         }
 
