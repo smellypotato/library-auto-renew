@@ -60,6 +60,19 @@
         background: #2b6cff;
         color: white;
       }
+      #stop {
+        background: #d83b01;
+        color: white;
+      }
+      .run-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .run-actions button {
+        flex: 1;
+        margin-top: 0;
+      }
       #status {
         margin-top: 10px;
         font-size: 12px;
@@ -91,7 +104,10 @@
       <button id="add" type="button">Add</button>
     </div>
 
-    <button id="start" type="button">Start all</button>
+    <div class="run-actions">
+      <button id="start" type="button">Start all</button>
+      <button id="stop" type="button" hidden>Stop</button>
+    </div>
     <div id="status" aria-live="polite"></div>
 
     <script src="popup.js"></script>

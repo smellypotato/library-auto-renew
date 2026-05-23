@@ -7,6 +7,8 @@ const WEBCAT_LOGOUT_URL =
   "https://webcat.hkpl.gov.hk/auth/logout?theme=WEB&locale=zh_TW";
 const FLOW_TIMEOUT_MS = 45000;
 const PHASE_PAGE_TIMEOUT_MS = 30000;
+/** Extra time after flow timeout before treating a run as stale. */
+const STALE_RUN_GRACE_MS = 5000;
 const CALENDAR_DAY_CHECK_ALARM = "calendarDayCheck";
 /** Minimum Chrome period for repeating alarms; checks often enough to notice a new calendar day. */
 const CALENDAR_DAY_CHECK_PERIOD_MINUTES = 30;
@@ -22,6 +24,7 @@ const ASYNC_MESSAGE_TYPES = new Set([
   "REMOVE_ACCOUNT",
   "RUN_ALL",
   "RUN_ONE",
+  "CANCEL_RUN",
   "START_LOGIN",
   "LOGOUT_DONE",
 ]);
@@ -121,6 +124,185 @@ async function getState(keys) {
 
 async function setState(obj) {
   await chrome.storage.local.set(obj);
+}
+
+async function tabExists(tabId) {
+  if (typeof tabId !== "number") return false;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  return !!tab;
+}
+
+async function clearRunAlarmsForTab(tabId) {
+  if (typeof tabId !== "number") return;
+  await clearPagePhaseAlarm(tabId);
+  chrome.alarms.clear(`flowTimeout:${tabId}`).catch(() => {});
+}
+
+async function isRunStale() {
+  const {
+    runningAll = false,
+    runningOne = false,
+    runState,
+    runTabId,
+    runnerTabId,
+    runStartedAt,
+  } = await getState([
+    "runningAll",
+    "runningOne",
+    "runState",
+    "runTabId",
+    "runnerTabId",
+    "runStartedAt",
+  ]);
+
+  const active = runningAll || runningOne || runState === "running";
+  if (!active) return false;
+
+  const tabId =
+    typeof runTabId === "number"
+      ? runTabId
+      : typeof runnerTabId === "number"
+        ? runnerTabId
+        : null;
+
+  if (typeof tabId === "number") {
+    if (!(await tabExists(tabId))) return true;
+    if (
+      runStartedAt &&
+      Date.now() - runStartedAt > FLOW_TIMEOUT_MS + STALE_RUN_GRACE_MS
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  if (!runStartedAt) return true;
+  return Date.now() - runStartedAt > STALE_RUN_GRACE_MS;
+}
+
+let abortRunChain = Promise.resolve();
+let abortInProgress = false;
+
+async function abortRun(options = {}) {
+  const p = abortRunChain.then(() => abortRunImpl(options).catch(() => {}));
+  abortRunChain = p.catch(() => {});
+  return p;
+}
+
+async function abortRunImpl({
+  reason = "Run stopped.",
+  details = null,
+  markCurrentFailed = true,
+} = {}) {
+  if (abortInProgress) return;
+  abortInProgress = true;
+  try {
+    const {
+      runningAll = false,
+      runningOne = false,
+      runState,
+      runTabId,
+      runnerTabId,
+      currentAccountId,
+      accountResults = {},
+      accounts = [],
+      runStartedAt,
+    } = await getState([
+      "runningAll",
+      "runningOne",
+      "runState",
+      "runTabId",
+      "runnerTabId",
+      "currentAccountId",
+      "accountResults",
+      "accounts",
+      "runStartedAt",
+    ]);
+
+    const wasActive =
+      runningAll || runningOne || runState === "running" || currentAccountId;
+    if (!wasActive) return;
+
+    const failDetails = details || reason;
+    const tabIds = new Set();
+    if (typeof runTabId === "number") tabIds.add(runTabId);
+    if (typeof runnerTabId === "number") tabIds.add(runnerTabId);
+    for (const id of tabIds) {
+      await clearRunAlarmsForTab(id);
+    }
+
+    if (markCurrentFailed) {
+      if (runningAll) {
+        for (const acct of accounts) {
+          const st = accountResults[acct.id]?.state;
+          if (st === "pending") {
+            accountResults[acct.id] = {
+              state: "failed",
+              details: "Cancelled.",
+              finishedAt: Date.now(),
+            };
+          } else if (st === "running") {
+            accountResults[acct.id] = {
+              state: "failed",
+              details: failDetails,
+              finishedAt: Date.now(),
+            };
+          }
+        }
+      } else if (
+        currentAccountId &&
+        (runningOne || runState === "running")
+      ) {
+        accountResults[currentAccountId] = {
+          state: "failed",
+          details: failDetails,
+          finishedAt: Date.now(),
+        };
+      }
+      await setState({ accountResults });
+    }
+
+    await setState({
+      runningAll: false,
+      runningOne: false,
+      currentAccountId: null,
+      currentAccount: null,
+      runnerTabId: null,
+      queueIndex: 0,
+      shouldLogout: false,
+      didClickLogout: false,
+      didConfirmLogout: false,
+      didNotifyLogoutDone: false,
+      waitingForRenewResult: false,
+      renewResultSeen: false,
+      renewAttempted: false,
+      runError: reason,
+      runDetails: markCurrentFailed ? failDetails : null,
+    });
+
+    await setRunState({
+      runState: "failed",
+      runError: reason,
+      runTabId: null,
+      runStartedAt,
+      runFinishedAt: Date.now(),
+    });
+
+    await computeAndSetBadge();
+  } finally {
+    abortInProgress = false;
+  }
+}
+
+async function clearStaleRunIfNeeded() {
+  if (!(await isRunStale())) return false;
+  await abortRun({
+    reason: "Previous run did not finish (tab closed or timed out).",
+    details:
+      "Failed: previous run was interrupted (tab closed or timed out).",
+    markCurrentFailed: true,
+  });
+  return true;
 }
 
 async function computeAndSetBadge() {
@@ -300,6 +482,8 @@ async function runSingleAccountById(id) {
 }
 
 async function runSingleAccountByIdImpl(id) {
+  await clearStaleRunIfNeeded();
+
   const { runningAll = false, runningOne = false } = await getState([
     "runningAll",
     "runningOne",
@@ -475,7 +659,13 @@ async function maybeAutoRunTodayCore() {
     "accounts",
   ]);
 
-  if (runningAll || runningOne) return;
+  await clearStaleRunIfNeeded();
+
+  const {
+    runningAll: runningAllAfterStale = false,
+    runningOne: runningOneAfterStale = false,
+  } = await getState(["runningAll", "runningOne"]);
+  if (runningAllAfterStale || runningOneAfterStale) return;
   if (!accounts.length) return;
 
   const today = todayKey();
@@ -668,6 +858,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case "RUN_ALL": {
+          await clearStaleRunIfNeeded();
           const {
             accounts = [],
             runningAll = false,
@@ -716,6 +907,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             break;
           }
           await computeAndSetBadge();
+          sendResponse({ ok: true });
+          break;
+        }
+
+        case "CANCEL_RUN": {
+          const { runnerTabId = null, runTabId = null } = await getState([
+            "runnerTabId",
+            "runTabId",
+          ]);
+          const tabId =
+            typeof runTabId === "number"
+              ? runTabId
+              : typeof runnerTabId === "number"
+                ? runnerTabId
+                : null;
+          await abortRun({
+            reason: "Run stopped.",
+            details: "Stopped by user.",
+            markCurrentFailed: true,
+          });
+          if (typeof tabId === "number") {
+            chrome.tabs.remove(tabId).catch(() => {});
+          }
           sendResponse({ ok: true });
           break;
         }
@@ -1015,5 +1229,35 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     chrome.tabs
       .update(tabId, { url: WEBCAT_LOGOUT_URL, active: false })
       .catch(() => {});
+  })().catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  (async () => {
+    const {
+      runningAll = false,
+      runningOne = false,
+      runState,
+      runTabId,
+      runnerTabId,
+    } = await getState([
+      "runningAll",
+      "runningOne",
+      "runState",
+      "runTabId",
+      "runnerTabId",
+    ]);
+
+    if (!runningAll && !runningOne && runState !== "running") return;
+
+    const isRunner = tabId === runnerTabId;
+    const isRunTab = tabId === runTabId;
+    if (!isRunner && !isRunTab) return;
+
+    await abortRun({
+      reason: "Runner tab was closed.",
+      details: "Failed: runner tab was closed before the flow finished.",
+      markCurrentFailed: true,
+    });
   })().catch(() => {});
 });

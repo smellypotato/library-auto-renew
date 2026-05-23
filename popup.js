@@ -28,7 +28,7 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
-function renderAccounts(accounts, results) {
+function renderAccounts(accounts, results, isRunning) {
   const container = $("accounts");
   if (!accounts?.length) {
     container.innerHTML =
@@ -111,7 +111,8 @@ function renderAccounts(accounts, results) {
               type="button"
               title="Run this account"
               aria-label="Run this account"
-              style="width:auto; padding:6px 8px; border-radius:8px; background:rgba(43,108,255,.2); color:inherit; display:flex; align-items:center; justify-content:center;"
+              ${isRunning ? "disabled" : ""}
+              style="width:auto; padding:6px 8px; border-radius:8px; background:rgba(43,108,255,.2); color:inherit; display:flex; align-items:center; justify-content:center;${isRunning ? " opacity:.45; cursor:not-allowed;" : ""}"
             >
               ${playIcon}
             </button>
@@ -231,11 +232,30 @@ async function refresh() {
     "runError",
   ]);
 
-  renderAccounts(accounts, accountResults);
+  const isRunning = runningAll || runningOne;
+  renderAccounts(accounts, accountResults, isRunning);
 
-  if (runningAll || runningOne) setStatus("Running accounts…");
+  $("start").hidden = isRunning;
+  $("stop").hidden = !isRunning;
+
+  if (isRunning) setStatus("Running accounts…");
   else if (runError) setStatus(runError);
   else setStatus("");
+}
+
+async function stopRun() {
+  setStatus("Stopping…");
+  try {
+    const resp = await sendMessageAsync({ type: "CANCEL_RUN" });
+    if (!resp?.ok) {
+      setStatus(resp?.error ?? "Could not stop run.");
+      return;
+    }
+    setStatus("Stopped.");
+    await refresh();
+  } catch (e) {
+    setStatus(`Failed: ${e.message}`);
+  }
 }
 
 async function start() {
@@ -297,6 +317,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   await refresh();
   $("start").addEventListener("click", start);
+  $("stop").addEventListener("click", stopRun);
   $("add").addEventListener("click", addAccount);
 
   document.addEventListener("keydown", (e) => {
