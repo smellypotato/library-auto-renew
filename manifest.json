@@ -55,6 +55,11 @@
       ],
       "js": ["patron-checkall-content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://webcat.hkpl.gov.hk/wicket/page?*"],
+      "js": ["webcat-renew-result-content.js"],
+      "run_at": "document_idle"
     }
   ]
 }

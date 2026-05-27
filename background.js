@@ -2,7 +2,13 @@ const TARGET_AFTER_LOGIN = "https://webcat.hkpl.gov.hk/search/query?theme=WEB";
 const LOGIN_URL = "https://www.hkpl.gov.hk/tc/login.html";
 const ACCOUNT_URL =
   "https://webcat.hkpl.gov.hk/wicket/bookmarkable/com.vtls.chamo.webapp.component.patron.PatronAccountPage?theme=WEB";
-const RENEW_RESULT_URL_PREFIX = "https://webcat.hkpl.gov.hk/wicket/page?7";
+const WEBCAT_WICKET_PAGE_PREFIX = "https://webcat.hkpl.gov.hk/wicket/page?";
+
+/** Wicket page id varies (e.g. ?5, ?7); match any renew-result wicket page URL. */
+function isRenewResultUrl(url) {
+  if (!url || !url.startsWith(WEBCAT_WICKET_PAGE_PREFIX)) return false;
+  return /^\d/.test(url.slice(WEBCAT_WICKET_PAGE_PREFIX.length));
+}
 const WEBCAT_LOGOUT_URL =
   "https://webcat.hkpl.gov.hk/auth/logout?theme=WEB&locale=zh_TW";
 const FLOW_TIMEOUT_MS = 45000;
@@ -31,7 +37,7 @@ const ASYNC_MESSAGE_TYPES = new Set([
 
 function isPhaseTimeoutExemptUrl(url) {
   if (!url || !url.startsWith("http")) return true;
-  if (url.startsWith(RENEW_RESULT_URL_PREFIX)) return true;
+  if (isRenewResultUrl(url)) return true;
   if (url.includes("/auth/logout")) return true;
   if (url.includes("confirm_logout")) return true;
   if (url.includes("/logout.html")) return true;
@@ -604,6 +610,41 @@ async function isAuthorizedLogoutTab(senderTabId) {
   return senderTabId === runTabId;
 }
 
+async function handleRenewResultSuccess(tabId) {
+  const { runState, runTabId, waitingForRenewResult } = await getState([
+    "runState",
+    "runTabId",
+    "waitingForRenewResult",
+  ]);
+  if (runState !== "running" || runTabId !== tabId || !waitingForRenewResult) {
+    return false;
+  }
+
+  await clearPagePhaseAlarm(tabId);
+
+  await chrome.storage.local.set({
+    renewResultSeen: true,
+    waitingForRenewResult: false,
+    shouldLogout: true,
+    runDetails: "Success: renew result page opened.",
+  });
+
+  chrome.tabs
+    .update(tabId, { url: WEBCAT_LOGOUT_URL, active: false })
+    .catch(() => {});
+
+  await setRunState({
+    runState: "success",
+    runError: null,
+    runTabId: tabId,
+    runStartedAt: (await chrome.storage.local.get(["runStartedAt"]))
+      .runStartedAt,
+    runFinishedAt: Date.now(),
+  });
+
+  return true;
+}
+
 async function failRunAndLogout(tabId, runError, runDetails) {
   const { runState, runTabId } = await getState(["runState", "runTabId"]);
   if (runState !== "running") return;
@@ -793,6 +834,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             "Timed out or could not find an expected element on this page.";
           const details = `Failed (${phase}): ${err}`;
           await failRunAndLogout(senderTabId, err, details);
+          break;
+        }
+
+        case "RENEW_RESULT_DETECTED": {
+          const senderTabId = sender.tab?.id;
+          if (typeof senderTabId !== "number") return;
+          await handleRenewResultSuccess(senderTabId);
           break;
         }
 
@@ -1050,34 +1098,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (runState !== "running") return;
     if (runTabId !== tabId) return;
 
-    if (url.startsWith(RENEW_RESULT_URL_PREFIX)) {
+    if (isRenewResultUrl(url)) {
       const { waitingForRenewResult } = await chrome.storage.local.get([
         "waitingForRenewResult",
       ]);
       if (!waitingForRenewResult) return;
-
-      await clearPagePhaseAlarm(tabId);
-
-      await chrome.storage.local.set({
-        renewResultSeen: true,
-        waitingForRenewResult: false,
-        shouldLogout: true,
-        runDetails: "Success: renew result page opened.",
-      });
-
-      chrome.tabs
-        .update(tabId, { url: WEBCAT_LOGOUT_URL, active: false })
-        .catch(() => {});
-
-      await setRunState({
-        runState: "success",
-        runError: null,
-        runTabId: tabId,
-        runStartedAt: (await chrome.storage.local.get(["runStartedAt"]))
-          .runStartedAt,
-        runFinishedAt: Date.now(),
-      });
-
+      await handleRenewResultSuccess(tabId);
       return;
     }
     if (url.startsWith(TARGET_AFTER_LOGIN)) {
