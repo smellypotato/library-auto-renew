@@ -12,9 +12,13 @@ function isRenewResultUrl(url) {
 const WEBCAT_LOGOUT_URL =
   "https://webcat.hkpl.gov.hk/auth/logout?theme=WEB&locale=zh_TW";
 const FLOW_TIMEOUT_MS = 45000;
+/** Keep in sync with PHASE_PAGE_TIMEOUT_MS in content scripts. */
 const PHASE_PAGE_TIMEOUT_MS = 30000;
 /** Extra time after flow timeout before treating a run as stale. */
 const STALE_RUN_GRACE_MS = 5000;
+/** If LOGOUT_DONE never arrives after a failure, force-advance the queue. */
+const QUEUE_ADVANCE_WATCHDOG_MS = 15000;
+const QUEUE_ADVANCE_WATCHDOG_ALARM = "queueAdvanceWatchdog";
 const CALENDAR_DAY_CHECK_ALARM = "calendarDayCheck";
 /** Minimum Chrome period for repeating alarms; checks often enough to notice a new calendar day. */
 const CALENDAR_DAY_CHECK_PERIOD_MINUTES = 30;
@@ -42,6 +46,28 @@ function isPhaseTimeoutExemptUrl(url) {
   if (url.includes("confirm_logout")) return true;
   if (url.includes("/logout.html")) return true;
   return false;
+}
+
+function isHkplLoginUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return (
+      u.hostname === "www.hkpl.gov.hk" &&
+      /\/login\.html$/i.test(u.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWebcatUrl(url) {
+  if (!url) return false;
+  try {
+    return new URL(url).hostname === "webcat.hkpl.gov.hk";
+  } catch {
+    return url.includes("webcat.hkpl.gov.hk");
+  }
 }
 
 async function clearPagePhaseAlarm(tabId) {
@@ -77,6 +103,24 @@ async function maybeRearmPagePhaseSameUrl(tabId, url) {
   await armPagePhaseAlarm(tabId, url);
 }
 
+async function clearQueueAdvanceWatchdog() {
+  chrome.alarms.clear(QUEUE_ADVANCE_WATCHDOG_ALARM).catch(() => {});
+  await chrome.storage.local.remove("queueAdvanceWatchdog");
+}
+
+async function armQueueAdvanceWatchdog(accountId, queueIndex) {
+  await clearQueueAdvanceWatchdog();
+  await chrome.storage.local.set({
+    queueAdvanceWatchdog: { accountId, queueIndex, armedAt: Date.now() },
+  });
+  chrome.alarms
+    .create(QUEUE_ADVANCE_WATCHDOG_ALARM, {
+      when: Date.now() + QUEUE_ADVANCE_WATCHDOG_MS,
+    })
+    .catch(() => {});
+}
+
+/** Persist run fields only; badge is always via computeAndSetBadge. */
 async function setRunState(state) {
   await chrome.storage.local.set({
     runState: state.runState,
@@ -85,16 +129,6 @@ async function setRunState(state) {
     runStartedAt: state.runStartedAt ?? null,
     runFinishedAt: state.runFinishedAt ?? null,
   });
-
-  if (state.runState === "failed") {
-    chrome.action.setBadgeText({ text: "ERR" }).catch(() => {});
-  } else if (state.runState === "success") {
-    chrome.action.setBadgeText({ text: "OK" }).catch(() => {});
-  } else if (state.runState === "running") {
-    chrome.action.setBadgeText({ text: "…" }).catch(() => {});
-  } else {
-    chrome.action.setBadgeText({ text: "" }).catch(() => {});
-  }
 }
 
 function ensureCalendarDayCheckAlarm() {
@@ -106,18 +140,40 @@ function ensureCalendarDayCheckAlarm() {
   });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.action.setBadgeBackgroundColor({ color: "#d83b01" }).catch(() => {});
-  ensureCalendarDayCheckAlarm();
-  maybeAutoRunToday().catch(() => {});
-});
-
 function todayKey() {
   const d = new Date();
   const yyyy = String(d.getFullYear());
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function dateKeyFromTimestamp(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  const yyyy = String(d.getFullYear());
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function isSuccessForToday(result) {
+  return (
+    result?.state === "success" &&
+    dateKeyFromTimestamp(result.finishedAt) === todayKey()
+  );
+}
+
+function allAccountsSuccessForToday(accounts, accountResults) {
+  return (
+    accounts.length > 0 &&
+    accounts.every((a) => isSuccessForToday(accountResults?.[a.id]))
+  );
+}
+
+function accountHasPasswordExpiryAlert(result) {
+  return (result?.alerts ?? []).some((a) => a?.type === "password_expiry");
 }
 
 function newId() {
@@ -130,6 +186,20 @@ async function getState(keys) {
 
 async function setState(obj) {
   await chrome.storage.local.set(obj);
+}
+
+async function markAutoRunDoneForToday() {
+  await setState({ lastAutoRunDate: todayKey() });
+}
+
+async function maybeMarkDayDoneIfAllSuccess() {
+  const { accounts = [], accountResults = {} } = await getState([
+    "accounts",
+    "accountResults",
+  ]);
+  if (allAccountsSuccessForToday(accounts, accountResults)) {
+    await markAutoRunDoneForToday();
+  }
 }
 
 async function tabExists(tabId) {
@@ -199,10 +269,13 @@ async function abortRunImpl({
   reason = "Run stopped.",
   details = null,
   markCurrentFailed = true,
+  pendingDetails = null,
 } = {}) {
   if (abortInProgress) return;
   abortInProgress = true;
   try {
+    await clearQueueAdvanceWatchdog();
+
     const {
       runningAll = false,
       runningOne = false,
@@ -229,7 +302,11 @@ async function abortRunImpl({
       runningAll || runningOne || runState === "running" || currentAccountId;
     if (!wasActive) return;
 
+    const wasRunningAll = runningAll;
     const failDetails = details || reason;
+    const remainingDetails =
+      pendingDetails ||
+      "Failed: queue stopped after a prior account could not finish cleanup.";
     const tabIds = new Set();
     if (typeof runTabId === "number") tabIds.add(runTabId);
     if (typeof runnerTabId === "number") tabIds.add(runnerTabId);
@@ -240,15 +317,18 @@ async function abortRunImpl({
     if (markCurrentFailed) {
       if (runningAll) {
         for (const acct of accounts) {
-          const st = accountResults[acct.id]?.state;
+          const prev = accountResults[acct.id] ?? {};
+          const st = prev.state;
           if (st === "pending") {
             accountResults[acct.id] = {
+              ...prev,
               state: "failed",
-              details: "Cancelled.",
+              details: remainingDetails,
               finishedAt: Date.now(),
             };
           } else if (st === "running") {
             accountResults[acct.id] = {
+              ...prev,
               state: "failed",
               details: failDetails,
               finishedAt: Date.now(),
@@ -259,7 +339,9 @@ async function abortRunImpl({
         currentAccountId &&
         (runningOne || runState === "running")
       ) {
+        const prev = accountResults[currentAccountId] ?? {};
         accountResults[currentAccountId] = {
+          ...prev,
           state: "failed",
           details: failDetails,
           finishedAt: Date.now(),
@@ -275,6 +357,7 @@ async function abortRunImpl({
       currentAccount: null,
       runnerTabId: null,
       queueIndex: 0,
+      runQueueIds: null,
       shouldLogout: false,
       didClickLogout: false,
       didConfirmLogout: false,
@@ -294,6 +377,11 @@ async function abortRunImpl({
       runFinishedAt: Date.now(),
     });
 
+    // Interrupted multi-account run ends auto-run for the calendar day.
+    if (wasRunningAll) {
+      await markAutoRunDoneForToday();
+    }
+
     await computeAndSetBadge();
   } finally {
     abortInProgress = false;
@@ -306,16 +394,27 @@ async function clearStaleRunIfNeeded() {
     reason: "Previous run did not finish (tab closed or timed out).",
     details:
       "Failed: previous run was interrupted (tab closed or timed out).",
+    pendingDetails:
+      "Failed: queue stopped after a prior account could not finish cleanup.",
     markCurrentFailed: true,
   });
   return true;
 }
 
 async function computeAndSetBadge() {
-  const { runningAll = false, accounts = [], accountResults = {} } =
-    await getState(["runningAll", "accounts", "accountResults"]);
+  const {
+    runningAll = false,
+    runningOne = false,
+    accounts = [],
+    accountResults = {},
+  } = await getState([
+    "runningAll",
+    "runningOne",
+    "accounts",
+    "accountResults",
+  ]);
 
-  if (runningAll) {
+  if (runningAll || runningOne) {
     chrome.action.setBadgeText({ text: "…" }).catch(() => {});
     return;
   }
@@ -325,14 +424,21 @@ async function computeAndSetBadge() {
     return;
   }
 
-  const states = accounts.map((a) => accountResults?.[a.id]?.state ?? "pending");
+  const states = accounts.map(
+    (a) => accountResults?.[a.id]?.state ?? "pending",
+  );
   const anyFailed = states.some((s) => s === "failed");
   const allSuccess = states.length > 0 && states.every((s) => s === "success");
+  const anyExpiryAlert = accounts.some((a) =>
+    accountHasPasswordExpiryAlert(accountResults?.[a.id]),
+  );
 
-  if (allSuccess) {
-    chrome.action.setBadgeText({ text: "OK" }).catch(() => {});
-  } else if (anyFailed) {
+  if (anyFailed) {
     chrome.action.setBadgeText({ text: "ERR" }).catch(() => {});
+  } else if (anyExpiryAlert) {
+    chrome.action.setBadgeText({ text: "!" }).catch(() => {});
+  } else if (allSuccess) {
+    chrome.action.setBadgeText({ text: "OK" }).catch(() => {});
   } else {
     chrome.action.setBadgeText({ text: "" }).catch(() => {});
   }
@@ -391,16 +497,30 @@ async function startNextAccountIfAny() {
   return p;
 }
 
+async function getActiveRunQueue() {
+  const { runQueueIds = null, accounts = [] } = await getState([
+    "runQueueIds",
+    "accounts",
+  ]);
+  if (Array.isArray(runQueueIds) && runQueueIds.length) {
+    return runQueueIds;
+  }
+  return accounts.map((a) => a.id);
+}
+
 async function startNextAccountIfAnyImpl() {
-  const {
-    runningAll = false,
-    accounts = [],
-    queueIndex = 0,
-  } = await getState(["runningAll", "accounts", "queueIndex"]);
+  const { runningAll = false, queueIndex = 0, accounts = [] } = await getState([
+    "runningAll",
+    "queueIndex",
+    "accounts",
+  ]);
 
   if (!runningAll) return;
 
-  if (queueIndex >= accounts.length) {
+  const queue = await getActiveRunQueue();
+
+  if (queueIndex >= queue.length) {
+    await clearQueueAdvanceWatchdog();
     const { runnerTabId = null } = await getState(["runnerTabId"]);
     if (typeof runnerTabId === "number") {
       chrome.tabs.remove(runnerTabId).catch(() => {});
@@ -410,16 +530,27 @@ async function startNextAccountIfAnyImpl() {
       runningAll: false,
       currentAccountId: null,
       currentAccount: null,
+      runQueueIds: null,
     });
-    await setState({ lastAutoRunDate: todayKey() });
+    await markAutoRunDoneForToday();
     await computeAndSetBadge();
     return;
   }
 
-  const acct = accounts[queueIndex];
+  const acctId = queue[queueIndex];
+  const acct = accounts.find((a) => a.id === acctId);
+  if (!acct) {
+    await setState({ queueIndex: queueIndex + 1 });
+    await startNextAccountIfAny();
+    return;
+  }
 
   const { accountResults = {} } = await getState(["accountResults"]);
-  accountResults[acct.id] = { state: "running", details: "" };
+  accountResults[acct.id] = {
+    state: "running",
+    details: "",
+    // Clear prior alerts for this account on a new run.
+  };
   await setState({ accountResults });
 
   await setState({
@@ -437,6 +568,7 @@ async function startNextAccountIfAnyImpl() {
     runStartedAt,
     runFinishedAt: null,
   });
+  await computeAndSetBadge();
 
   const tabId = await ensureRunnerTab();
   if (typeof tabId !== "number") {
@@ -453,8 +585,7 @@ async function startNextAccountIfAnyImpl() {
     });
     await finalizeCurrentAccountResult();
     await computeAndSetBadge();
-    const { queueIndex: qi = 0 } = await getState(["queueIndex"]);
-    await setState({ queueIndex: qi + 1 });
+    await setState({ queueIndex: queueIndex + 1 });
     await startNextAccountIfAny();
     return;
   }
@@ -475,6 +606,75 @@ async function startNextAccountIfAnyImpl() {
   chrome.alarms.create(`flowTimeout:${tabId}`, {
     when: Date.now() + FLOW_TIMEOUT_MS,
   });
+}
+
+/**
+ * Finalize current account (idempotent), advance queueIndex, start next.
+ * Used after success/failure once the tab is ready for the next login.
+ * Serialized + keyed so LOGOUT_DONE and the watchdog cannot double-advance.
+ */
+let advanceQueueChain = Promise.resolve();
+
+async function advanceQueueAfterAccountTerminal() {
+  const p = advanceQueueChain.then(() =>
+    advanceQueueAfterAccountTerminalImpl().catch(() => ({
+      moreAccounts: false,
+      skipped: true,
+    })),
+  );
+  advanceQueueChain = p.catch(() => {});
+  return p;
+}
+
+async function advanceQueueAfterAccountTerminalImpl() {
+  await clearQueueAdvanceWatchdog();
+
+  const {
+    runningAll = false,
+    runningOne = false,
+    currentAccountId = null,
+    queueIndex = 0,
+    lastQueueAdvanceKey = null,
+  } = await getState([
+    "runningAll",
+    "runningOne",
+    "currentAccountId",
+    "queueIndex",
+    "lastQueueAdvanceKey",
+  ]);
+
+  if (!runningAll && !runningOne) {
+    await computeAndSetBadge();
+    return { moreAccounts: false, skipped: true };
+  }
+
+  const advanceKey = `${currentAccountId ?? ""}:${queueIndex}`;
+  if (lastQueueAdvanceKey === advanceKey) {
+    return { moreAccounts: false, skipped: true };
+  }
+
+  await finalizeCurrentAccountResult();
+  await setState({ lastQueueAdvanceKey: advanceKey });
+
+  if (runningAll) {
+    const queue = await getActiveRunQueue();
+    const nextIndex = queueIndex + 1;
+    await setState({ queueIndex: nextIndex });
+    await computeAndSetBadge();
+    await startNextAccountIfAny();
+    return { moreAccounts: nextIndex < queue.length };
+  }
+
+  // runningOne
+  await setState({ runningOne: false });
+  const { runnerTabId = null } = await getState(["runnerTabId"]);
+  if (typeof runnerTabId === "number") {
+    chrome.tabs.remove(runnerTabId).catch(() => {});
+    await setState({ runnerTabId: null });
+  }
+  await maybeMarkDayDoneIfAllSuccess();
+  await computeAndSetBadge();
+  return { moreAccounts: false };
 }
 
 let runSingleAccountChain = Promise.resolve();
@@ -515,6 +715,8 @@ async function runSingleAccountByIdImpl(id) {
     runningOne: true,
     currentAccountId: acct.id,
     currentAccount: { account: acct.account, password: acct.password },
+    runQueueIds: null,
+    lastQueueAdvanceKey: null,
   });
 
   await resetFlowFlagsForAccountRun();
@@ -527,6 +729,7 @@ async function runSingleAccountByIdImpl(id) {
     runStartedAt,
     runFinishedAt: null,
   });
+  await computeAndSetBadge();
 
   const tabId = await ensureRunnerTab();
   if (typeof tabId !== "number") {
@@ -583,13 +786,64 @@ async function finalizeCurrentAccountResult() {
   ]);
   if (!currentAccountId) return;
 
+  const prev = accountResults[currentAccountId] ?? {};
+  // Idempotent: do not overwrite an already-terminal result for this run.
+  if (prev.state === "success" || prev.state === "failed") {
+    if (prev.finishedAt) return;
+  }
+
+  const nextState = runState === "success" ? "success" : "failed";
   accountResults[currentAccountId] = {
-    state: runState === "success" ? "success" : "failed",
-    details: runDetails || runError || "",
+    ...prev,
+    state: nextState,
+    details: runDetails || runError || prev.details || "",
     finishedAt: Date.now(),
+    alerts: prev.alerts ?? [],
   };
 
   await setState({ accountResults });
+}
+
+async function attachPasswordExpiryAlert(message) {
+  const { currentAccountId, accountResults = {} } = await getState([
+    "currentAccountId",
+    "accountResults",
+  ]);
+  if (!currentAccountId) return;
+
+  const days = message.days;
+  const dateText = message.dateText || "";
+  let text;
+  if (typeof days === "number" && dateText) {
+    text = `Password expires in ${days} days (${dateText}).`;
+  } else if (typeof days === "number") {
+    text = `Password expires in ${days} days.`;
+  } else if (dateText) {
+    text = `Password expires on ${dateText}.`;
+  } else {
+    text = "Password is nearing expiry. Change it soon.";
+  }
+
+  const prev = accountResults[currentAccountId] ?? {
+    state: "running",
+    details: "",
+  };
+  const otherAlerts = (prev.alerts ?? []).filter(
+    (a) => a?.type !== "password_expiry",
+  );
+  accountResults[currentAccountId] = {
+    ...prev,
+    alerts: [
+      ...otherAlerts,
+      {
+        type: "password_expiry",
+        message: text,
+        detectedAt: Date.now(),
+      },
+    ],
+  };
+  await setState({ accountResults });
+  await computeAndSetBadge();
 }
 
 async function isAuthorizedRunTab(senderTabId) {
@@ -608,6 +862,11 @@ async function isAuthorizedLogoutTab(senderTabId) {
     return false;
   }
   return senderTabId === runTabId;
+}
+
+/** Password-expiry warning arrives on the login page while the run is still active. */
+async function isAuthorizedPasswordExpiryTab(senderTabId) {
+  return isAuthorizedRunTab(senderTabId);
 }
 
 async function handleRenewResultSuccess(tabId) {
@@ -641,10 +900,30 @@ async function handleRenewResultSuccess(tabId) {
       .runStartedAt,
     runFinishedAt: Date.now(),
   });
+  await computeAndSetBadge();
+
+  const {
+    runningAll = false,
+    runningOne = false,
+    currentAccountId,
+    queueIndex = 0,
+  } = await getState([
+    "runningAll",
+    "runningOne",
+    "currentAccountId",
+    "queueIndex",
+  ]);
+  if (runningAll || runningOne) {
+    await armQueueAdvanceWatchdog(currentAccountId, queueIndex);
+  }
 
   return true;
 }
 
+/**
+ * Mark current account failed and either skip logout (still on login) or
+ * navigate to WebCat logout with a queue-advance watchdog.
+ */
 async function failRunAndLogout(tabId, runError, runDetails) {
   const { runState, runTabId } = await getState(["runState", "runTabId"]);
   if (runState !== "running") return;
@@ -656,7 +935,6 @@ async function failRunAndLogout(tabId, runError, runDetails) {
   await chrome.storage.local.set({
     runDetails,
     runError,
-    shouldLogout: true,
     waitingForRenewResult: false,
   });
 
@@ -672,9 +950,65 @@ async function failRunAndLogout(tabId, runError, runDetails) {
   await finalizeCurrentAccountResult();
   await computeAndSetBadge();
 
+  let currentUrl = "";
+  try {
+    const t = await chrome.tabs.get(runTabId);
+    currentUrl = t?.url ?? "";
+  } catch {
+    currentUrl = "";
+  }
+
+  const { runningAll = false, runningOne = false } = await getState([
+    "runningAll",
+    "runningOne",
+  ]);
+
+  // Still on HKPL login (or never reached WebCat): skip logout and advance.
+  if (!isWebcatUrl(currentUrl) || isHkplLoginUrl(currentUrl)) {
+    await setState({
+      shouldLogout: false,
+      didClickLogout: false,
+      didConfirmLogout: false,
+      didNotifyLogoutDone: false,
+    });
+
+    if (runningAll) {
+      const { queueIndex = 0 } = await getState(["queueIndex"]);
+      const queue = await getActiveRunQueue();
+      const moreAccounts = queueIndex + 1 < queue.length;
+      if (moreAccounts) {
+        await chrome.tabs
+          .update(runTabId, { url: LOGIN_URL, active: false })
+          .catch(() => {});
+      }
+      await advanceQueueAfterAccountTerminal();
+      return;
+    }
+
+    if (runningOne) {
+      await advanceQueueAfterAccountTerminal();
+      return;
+    }
+
+    await computeAndSetBadge();
+    return;
+  }
+
+  // On WebCat: logout, then LOGOUT_DONE (or watchdog) advances the queue.
+  await setState({ shouldLogout: true });
   chrome.tabs
     .update(runTabId, { url: WEBCAT_LOGOUT_URL, active: false })
     .catch(() => {});
+
+  if (runningAll) {
+    const { currentAccountId, queueIndex = 0 } = await getState([
+      "currentAccountId",
+      "queueIndex",
+    ]);
+    await armQueueAdvanceWatchdog(currentAccountId, queueIndex);
+  } else if (runningOne) {
+    await armQueueAdvanceWatchdog(null, 0);
+  }
 }
 
 /** Serialize so onStartup, onInstalled, and calendar alarm cannot start two runs in parallel. */
@@ -693,11 +1027,13 @@ async function maybeAutoRunTodayCore() {
     runningAll = false,
     runningOne = false,
     accounts = [],
+    accountResults = {},
   } = await getState([
     "lastAutoRunDate",
     "runningAll",
     "runningOne",
     "accounts",
+    "accountResults",
   ]);
 
   await clearStaleRunIfNeeded();
@@ -712,23 +1048,56 @@ async function maybeAutoRunTodayCore() {
   const today = todayKey();
   if (lastAutoRunDate === today) return;
 
-  const accountResults = Object.fromEntries(
-    accounts.map((a) => [a.id, { state: "pending", details: "" }]),
-  );
+  if (allAccountsSuccessForToday(accounts, accountResults)) {
+    await markAutoRunDoneForToday();
+    await computeAndSetBadge();
+    return;
+  }
+
+  const runQueueIds = accounts
+    .filter((a) => !isSuccessForToday(accountResults?.[a.id]))
+    .map((a) => a.id);
+
+  if (!runQueueIds.length) {
+    await markAutoRunDoneForToday();
+    await computeAndSetBadge();
+    return;
+  }
+
+  const nextResults = { ...accountResults };
+  for (const id of runQueueIds) {
+    nextResults[id] = { state: "pending", details: "" };
+  }
 
   await setState({
     runningAll: true,
     queueIndex: 0,
-    accountResults,
+    runQueueIds,
+    accountResults: nextResults,
     runError: null,
+    lastQueueAdvanceKey: null,
   });
   await computeAndSetBadge();
   await startNextAccountIfAny();
 }
 
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.action.setBadgeBackgroundColor({ color: "#d83b01" }).catch(() => {});
+  ensureCalendarDayCheckAlarm();
+  computeAndSetBadge()
+    .catch(() => {})
+    .finally(() => {
+      maybeAutoRunToday().catch(() => {});
+    });
+});
+
 chrome.runtime.onStartup.addListener(() => {
   ensureCalendarDayCheckAlarm();
-  maybeAutoRunToday().catch(() => {});
+  computeAndSetBadge()
+    .catch(() => {})
+    .finally(() => {
+      maybeAutoRunToday().catch(() => {});
+    });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -751,16 +1120,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const checkedNow = message.checkedNow ?? 0;
           const total = message.total ?? 0;
           const today = message.today ?? null;
+          const renewDaysBefore = [0, 1, 2, 3].includes(
+            Number(message.renewDaysBefore),
+          )
+            ? Number(message.renewDaysBefore)
+            : 0;
           const didClickRenew = !!message.didClickRenew;
           const displayOnlyLoanRows = !!message.displayOnlyLoanRows;
 
           if (total === 0 || checkedNow === 0) {
+            const windowLabel =
+              renewDaysBefore === 0
+                ? "due today or overdue"
+                : `due within ${renewDaysBefore} day(s) or overdue`;
             const details =
               total === 0 && !displayOnlyLoanRows
                 ? "Success: no borrowed items found."
                 : today
-                  ? `Success: no items due today (${today}).`
-                  : "Success: no items due today.";
+                  ? `Success: no items ${windowLabel} (${today}).`
+                  : `Success: no items ${windowLabel}.`;
 
             await chrome.storage.local.set({
               runDetails: details,
@@ -784,9 +1162,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 .runStartedAt,
               runFinishedAt: Date.now(),
             });
+            await computeAndSetBadge();
 
             if (typeof runTabId === "number") {
               chrome.alarms.clear(`flowTimeout:${runTabId}`).catch(() => {});
+            }
+
+            const {
+              runningAll = false,
+              runningOne = false,
+              currentAccountId,
+              queueIndex = 0,
+            } = await getState([
+              "runningAll",
+              "runningOne",
+              "currentAccountId",
+              "queueIndex",
+            ]);
+            if (runningAll || runningOne) {
+              await armQueueAdvanceWatchdog(currentAccountId, queueIndex);
             }
             return;
           }
@@ -800,27 +1194,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return;
           }
 
-          await chrome.storage.local.set({
-            runDetails: "Failed: selected item(s) but couldn't click Renew.",
-            shouldLogout: true,
-            renewAttempted: true,
-            waitingForRenewResult: false,
-          });
-
-          if (typeof runTabId === "number") {
-            chrome.tabs
-              .update(runTabId, { url: WEBCAT_LOGOUT_URL, active: false })
-              .catch(() => {});
-          }
-
-          await setRunState({
-            runState: "failed",
-            runError: "Could not click Renew button.",
-            runTabId,
-            runStartedAt: (await chrome.storage.local.get(["runStartedAt"]))
-              .runStartedAt,
-            runFinishedAt: Date.now(),
-          });
+          await failRunAndLogout(
+            senderTabId,
+            "Could not click Renew button.",
+            "Failed: selected item(s) but couldn't click Renew.",
+          );
           break;
         }
 
@@ -834,6 +1212,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             "Timed out or could not find an expected element on this page.";
           const details = `Failed (${phase}): ${err}`;
           await failRunAndLogout(senderTabId, err, details);
+          break;
+        }
+
+        case "PASSWORD_EXPIRY_WARNING": {
+          const senderTabId = sender.tab?.id;
+          if (!(await isAuthorizedPasswordExpiryTab(senderTabId))) return;
+          await attachPasswordExpiryAlert(message);
           break;
         }
 
@@ -855,7 +1240,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case "ADD_ACCOUNT": {
-          const { accounts = [] } = await getState(["accounts"]);
+          const { accounts = [], accountResults = {} } = await getState([
+            "accounts",
+            "accountResults",
+          ]);
           const id = newId();
           accounts.push({
             id,
@@ -863,7 +1251,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             password: message.password,
           });
           await setState({ accounts });
+
+          if (!isSuccessForToday(accountResults[id])) {
+            await setState({ lastAutoRunDate: null });
+          }
+          await computeAndSetBadge();
           sendResponse({ ok: true, id });
+          maybeAutoRunToday().catch(() => {});
           break;
         }
 
@@ -925,6 +1319,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             break;
           }
 
+          const runQueueIds = accounts.map((a) => a.id);
           const accountResults = Object.fromEntries(
             accounts.map((a) => [a.id, { state: "pending", details: "" }]),
           );
@@ -932,8 +1327,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await setState({
             runningAll: true,
             queueIndex: 0,
+            runQueueIds,
             accountResults,
             runError: null,
+            lastQueueAdvanceKey: null,
             runnerTabId: (await getState(["runnerTabId"])).runnerTabId ?? null,
           });
           await computeAndSetBadge();
@@ -973,6 +1370,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await abortRun({
             reason: "Run stopped.",
             details: "Stopped by user.",
+            pendingDetails: "Stopped by user.",
             markCurrentFailed: true,
           });
           if (typeof tabId === "number") {
@@ -1000,6 +1398,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             runStartedAt,
             runFinishedAt: null,
           });
+          await computeAndSetBadge();
           chrome.alarms.clear(`flowTimeout:${tabId}`).catch(() => {});
           chrome.alarms.create(`flowTimeout:${tabId}`, {
             when: Date.now() + FLOW_TIMEOUT_MS,
@@ -1031,30 +1430,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ]);
 
           if (runningAll) {
-            await finalizeCurrentAccountResult();
-            const { queueIndex = 0, accounts = [] } = await getState([
-              "queueIndex",
-              "accounts",
-            ]);
-            const nextIndex = queueIndex + 1;
-            await setState({ queueIndex: nextIndex });
-            const moreAccounts = nextIndex < accounts.length;
+            const { queueIndex = 0 } = await getState(["queueIndex"]);
+            const queue = await getActiveRunQueue();
+            const moreAccounts = queueIndex + 1 < queue.length;
             sendResponse({
               ok: true,
               goLogin: moreAccounts,
             });
-            await computeAndSetBadge();
-            await startNextAccountIfAny();
+            await advanceQueueAfterAccountTerminal();
           } else if (runningOne) {
-            await finalizeCurrentAccountResult();
             sendResponse({ ok: true, goLogin: false });
-            await setState({ runningOne: false });
-            const { runnerTabId = null } = await getState(["runnerTabId"]);
-            if (typeof runnerTabId === "number") {
-              chrome.tabs.remove(runnerTabId).catch(() => {});
-              await setState({ runnerTabId: null });
-            }
-            await computeAndSetBadge();
+            await advanceQueueAfterAccountTerminal();
           } else {
             sendResponse({ ok: true, goLogin: false });
             await computeAndSetBadge();
@@ -1123,6 +1509,55 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
   if (alarm.name === CALENDAR_DAY_CHECK_ALARM) {
     maybeAutoRunToday().catch(() => {});
+    return;
+  }
+
+  if (alarm.name === QUEUE_ADVANCE_WATCHDOG_ALARM) {
+    (async () => {
+      const {
+        queueAdvanceWatchdog,
+        runningAll = false,
+        runningOne = false,
+        currentAccountId,
+        queueIndex = 0,
+        runTabId,
+      } = await getState([
+        "queueAdvanceWatchdog",
+        "runningAll",
+        "runningOne",
+        "currentAccountId",
+        "queueIndex",
+        "runTabId",
+      ]);
+
+      if (!queueAdvanceWatchdog) return;
+      if (!runningAll && !runningOne) {
+        await clearQueueAdvanceWatchdog();
+        return;
+      }
+
+      // Still on the same account/index → LOGOUT_DONE never advanced us.
+      if (
+        runningAll &&
+        queueAdvanceWatchdog.accountId === currentAccountId &&
+        queueAdvanceWatchdog.queueIndex === queueIndex
+      ) {
+        if (typeof runTabId === "number") {
+          await chrome.tabs
+            .update(runTabId, { url: LOGIN_URL, active: false })
+            .catch(() => {});
+        }
+        await advanceQueueAfterAccountTerminal();
+        return;
+      }
+
+      if (runningOne) {
+        await advanceQueueAfterAccountTerminal();
+        return;
+      }
+
+      await clearQueueAdvanceWatchdog();
+    })().catch(() => {});
     return;
   }
 
@@ -1211,24 +1646,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       ]);
 
     if (waitingForRenewResult) {
-      await chrome.storage.local.set({
-        waitingForRenewResult: false,
-        shouldLogout: true,
-        runDetails: "Failed: renew result page did not appear.",
-      });
-
-      chrome.tabs
-        .update(tabId, { url: WEBCAT_LOGOUT_URL, active: false })
-        .catch(() => {});
-
-      await setRunState({
-        runState: "failed",
-        runError: "Renew result page did not appear.",
-        runTabId: tabId,
-        runStartedAt: (await chrome.storage.local.get(["runStartedAt"]))
-          .runStartedAt,
-        runFinishedAt: Date.now(),
-      });
+      await failRunAndLogout(
+        tabId,
+        "Renew result page did not appear.",
+        "Failed: renew result page did not appear.",
+      );
       return;
     }
 
@@ -1236,25 +1658,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       return;
     }
 
-    await setRunState({
-      runState: "failed",
-      runError:
-        "Flow timeout. Possible captcha/invalid credentials, or webcat page didn’t load.",
-      runTabId: tabId,
-      runStartedAt: (await chrome.storage.local.get(["runStartedAt"]))
-        .runStartedAt,
-      runFinishedAt: Date.now(),
-    });
-
-    await chrome.storage.local.set({
-      runDetails:
-        "Failed: flow timeout before reaching renew/logout completion.",
-      shouldLogout: true,
-    });
-
-    chrome.tabs
-      .update(tabId, { url: WEBCAT_LOGOUT_URL, active: false })
-      .catch(() => {});
+    await failRunAndLogout(
+      tabId,
+      "Flow timeout. Possible captcha/invalid credentials, or webcat page didn’t load.",
+      "Failed: flow timeout before reaching renew/logout completion.",
+    );
   })().catch(() => {});
 });
 
@@ -1283,6 +1691,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     await abortRun({
       reason: "Runner tab was closed.",
       details: "Failed: runner tab was closed before the flow finished.",
+      pendingDetails: "Failed: runner tab was closed before the flow finished.",
       markCurrentFailed: true,
     });
   })().catch(() => {});

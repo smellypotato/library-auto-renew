@@ -39,13 +39,26 @@
         margin: 10px 0 6px;
         opacity: 0.9;
       }
-      input {
+      input,
+      select {
         width: 100%;
         box-sizing: border-box;
         padding: 8px 10px;
         border-radius: 8px;
         border: 1px solid rgba(127, 127, 127, 0.35);
         background: transparent;
+      }
+      .setting-row {
+        margin: 0 0 12px;
+      }
+      .setting-row label {
+        margin-top: 0;
+      }
+      .setting-hint {
+        font-size: 11px;
+        opacity: 0.8;
+        margin-top: 4px;
+        line-height: 1.4;
       }
       button {
         width: 100%;
@@ -90,6 +103,19 @@
       This extension needs your library password to log in and renew loans on your behalf.
       Your password is stored only on this device in the extension’s local storage.
       The extension does not upload your password to any developer or third-party server; signing in happens through HKPL pages in your browser, similar to typing it yourself.
+    </div>
+
+    <div class="setting-row">
+      <label for="renewDaysBefore">Renew items due within</label>
+      <select id="renewDaysBefore" aria-describedby="renewDaysHint">
+        <option value="0">Due today or overdue (0 days)</option>
+        <option value="1">1 day before due (or overdue)</option>
+        <option value="2">2 days before due (or overdue)</option>
+        <option value="3">3 days before due (or overdue)</option>
+      </select>
+      <div id="renewDaysHint" class="setting-hint">
+        Also renews overdue items if the browser was closed on the due date.
+      </div>
     </div>
 
     <div id="accounts"></div>

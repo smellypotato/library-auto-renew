@@ -40,6 +40,34 @@
     return `${yyyy}-${mm}-${dd}`;
   }
 
+  function startOfLocalDay(date = new Date()) {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  }
+
+  function parseYyyyMmDdLocal(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s ?? "").trim());
+    if (!m) return null;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  }
+
+  function normalizeRenewDaysBefore(value) {
+    const n = Number(value);
+    if (n === 1 || n === 2 || n === 3) return n;
+    return 0;
+  }
+
+  /**
+   * Renew when due date is on/before (today + renewDaysBefore).
+   * Overdue items (due before today) always match, so a missed day still renews.
+   */
+  function shouldRenewDueDate(dueStr, renewDaysBefore) {
+    const due = parseYyyyMmDdLocal(dueStr);
+    if (!due) return false;
+    const threshold = startOfLocalDay();
+    threshold.setDate(threshold.getDate() + renewDaysBefore);
+    return due.getTime() <= threshold.getTime();
+  }
+
   const DUE_YYYY_MM_DD = /\b(\d{4}-\d{2}-\d{2})\b/;
 
   function isTrVisiblyHidden(tr) {
@@ -140,7 +168,7 @@
     };
   }
 
-  function checkDueTodayOnly() {
+  function checkDueWithinWindow(renewDaysBefore) {
     const today = formatYyyyMmDd(new Date());
     const checkout = document.querySelector("table#checkout");
     const loanRows = checkout ? getCheckoutLoanRows(checkout) : [];
@@ -148,7 +176,7 @@
     let checkedNow = 0;
     for (const { checkbox, due } of loanRows) {
       if (!checkbox) continue;
-      if (due === today && !checkbox.checked) {
+      if (shouldRenewDueDate(due, renewDaysBefore) && !checkbox.checked) {
         setNativeChecked(checkbox, true);
         dispatchInputEvents(checkbox);
         checkedNow += 1;
@@ -156,14 +184,30 @@
     }
 
     const total = loanRows.filter((r) => r.checkbox).length;
-    return { total, checkedNow, today };
+    return { total, checkedNow, today, renewDaysBefore };
   }
 
   let patronPollAttempts = 0;
+  let renewDaysBefore = 0;
+  let settingsReady = false;
+
+  chrome.storage.local
+    .get(["renewDaysBefore"])
+    .then((stored) => {
+      renewDaysBefore = normalizeRenewDaysBefore(stored.renewDaysBefore);
+      settingsReady = true;
+    })
+    .catch(() => {
+      renewDaysBefore = 0;
+      settingsReady = true;
+    });
+
   const timer = setInterval(() => {
+    if (!settingsReady) return;
+
     patronPollAttempts += 1;
 
-    const { total, checkedNow, today } = checkDueTodayOnly();
+    const { total, checkedNow, today } = checkDueWithinWindow(renewDaysBefore);
     const checkoutState = patronCheckoutLoansReadyState();
 
     if (
@@ -197,6 +241,7 @@
         total,
         checkedNow,
         today,
+        renewDaysBefore,
         didClickRenew,
         displayOnlyLoanRows: !!checkoutState.displayOnlyLoanRows,
         url: location.href,

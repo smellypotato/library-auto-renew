@@ -72,6 +72,15 @@ function renderAccounts(accounts, results, isRunning) {
       const r = results?.[a.id] ?? null;
       const state = r?.state ?? "idle";
       const details = r?.details ?? "";
+      const alerts = Array.isArray(r?.alerts) ? r.alerts : [];
+      const alertLines = alerts
+        .map((al) => al?.message)
+        .filter(Boolean)
+        .map(
+          (msg) =>
+            `<div style="font-size:11px; color:#c43e00; margin-top:2px; word-break:break-word;">${escapeHtml(msg)}</div>`,
+        )
+        .join("");
       const color =
         state === "success"
           ? "#107c10"
@@ -95,6 +104,7 @@ function renderAccounts(accounts, results, isRunning) {
                 ? `<div style="font-size:11px; opacity:.85; margin-top:2px; word-break:break-word;">${escapeHtml(details)}</div>`
                 : ""
             }
+            ${alertLines}
           </div>
           <div style="display:flex; gap:6px;">
             <button
@@ -217,6 +227,12 @@ function renderAccounts(accounts, results, isRunning) {
   });
 }
 
+function normalizeRenewDaysBefore(value) {
+  const n = Number(value);
+  if (n === 1 || n === 2 || n === 3) return n;
+  return 0;
+}
+
 async function refresh() {
   const {
     accounts = [],
@@ -224,16 +240,23 @@ async function refresh() {
     runningAll = false,
     runningOne = false,
     runError,
+    renewDaysBefore = 0,
   } = await chrome.storage.local.get([
     "accounts",
     "accountResults",
     "runningAll",
     "runningOne",
     "runError",
+    "renewDaysBefore",
   ]);
 
   const isRunning = runningAll || runningOne;
   renderAccounts(accounts, accountResults, isRunning);
+
+  const daysSelect = $("renewDaysBefore");
+  if (daysSelect && document.activeElement !== daysSelect) {
+    daysSelect.value = String(normalizeRenewDaysBefore(renewDaysBefore));
+  }
 
   $("start").hidden = isRunning;
   $("stop").hidden = !isRunning;
@@ -241,6 +264,11 @@ async function refresh() {
   if (isRunning) setStatus("Running accounts…");
   else if (runError) setStatus(runError);
   else setStatus("");
+}
+
+async function saveRenewDaysBefore() {
+  const days = normalizeRenewDaysBefore($("renewDaysBefore")?.value);
+  await chrome.storage.local.set({ renewDaysBefore: days });
 }
 
 async function stopRun() {
@@ -310,12 +338,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       "runningOne",
       "runError",
       "runState",
+      "renewDaysBefore",
     ];
     if (!keys.some((k) => changes[k])) return;
     refresh().catch(() => {});
   });
 
   await refresh();
+  $("renewDaysBefore").addEventListener("change", () => {
+    saveRenewDaysBefore().catch(() => {});
+  });
   $("start").addEventListener("click", start);
   $("stop").addEventListener("click", stopRun);
   $("add").addEventListener("click", addAccount);
