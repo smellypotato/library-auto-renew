@@ -168,23 +168,61 @@
     };
   }
 
-  function checkDueWithinWindow(renewDaysBefore) {
+  /**
+   * Tick due checkboxes and summarize loans for renewal + popup alerts.
+   * Blocked rows (due date but no checkbox) need manual attention when due in window.
+   */
+  function analyzeCheckoutLoans(renewDaysBefore) {
     const today = formatYyyyMmDd(new Date());
     const checkout = document.querySelector("table#checkout");
     const loanRows = checkout ? getCheckoutLoanRows(checkout) : [];
 
     let checkedNow = 0;
+    let renewableDueCount = 0;
+    let blockedAttentionCount = 0;
+    const notRenewedByDue = new Map();
+
     for (const { checkbox, due } of loanRows) {
-      if (!checkbox) continue;
-      if (shouldRenewDueDate(due, renewDaysBefore) && !checkbox.checked) {
-        setNativeChecked(checkbox, true);
-        dispatchInputEvents(checkbox);
-        checkedNow += 1;
+      const dueInWindow = shouldRenewDueDate(due, renewDaysBefore);
+
+      if (checkbox) {
+        if (dueInWindow) {
+          renewableDueCount += 1;
+          if (!checkbox.checked) {
+            setNativeChecked(checkbox, true);
+            dispatchInputEvents(checkbox);
+            checkedNow += 1;
+          }
+        } else if (due) {
+          notRenewedByDue.set(due, (notRenewedByDue.get(due) ?? 0) + 1);
+        }
+      } else if (due) {
+        if (dueInWindow) blockedAttentionCount += 1;
+        notRenewedByDue.set(due, (notRenewedByDue.get(due) ?? 0) + 1);
       }
     }
 
+    let nearestExpiryDate = null;
+    let nearestExpiryCount = 0;
+    let notRenewedCount = 0;
+    if (notRenewedByDue.size > 0) {
+      nearestExpiryDate = [...notRenewedByDue.keys()].sort()[0];
+      nearestExpiryCount = notRenewedByDue.get(nearestExpiryDate) ?? 0;
+      notRenewedCount = [...notRenewedByDue.values()].reduce((a, b) => a + b, 0);
+    }
+
     const total = loanRows.filter((r) => r.checkbox).length;
-    return { total, checkedNow, today, renewDaysBefore };
+    return {
+      total,
+      checkedNow,
+      renewableDueCount,
+      blockedAttentionCount,
+      nearestExpiryDate,
+      nearestExpiryCount,
+      notRenewedCount,
+      today,
+      renewDaysBefore,
+    };
   }
 
   let patronPollAttempts = 0;
@@ -207,7 +245,16 @@
 
     patronPollAttempts += 1;
 
-    const { total, checkedNow, today } = checkDueWithinWindow(renewDaysBefore);
+    const {
+      total,
+      checkedNow,
+      renewableDueCount,
+      blockedAttentionCount,
+      nearestExpiryDate,
+      nearestExpiryCount,
+      notRenewedCount,
+      today,
+    } = analyzeCheckoutLoans(renewDaysBefore);
     const checkoutState = patronCheckoutLoansReadyState();
 
     if (
@@ -234,12 +281,17 @@
         document.querySelector("button[value='Renew']") ||
         document.querySelector("button[type='submit']#button\\.renew");
 
-      const didClickRenew = !!renewButton && checkedNow > 0;
+      const didClickRenew = !!renewButton && renewableDueCount > 0;
 
       chrome.runtime.sendMessage({
         type: "PATRON_CHECKED",
         total,
         checkedNow,
+        renewableDueCount,
+        blockedAttentionCount,
+        nearestExpiryDate,
+        nearestExpiryCount,
+        notRenewedCount,
         today,
         renewDaysBefore,
         didClickRenew,
@@ -247,7 +299,7 @@
         url: location.href,
       });
 
-      if (total > 0 && checkedNow === 0) {
+      if (total > 0 && renewableDueCount === 0) {
         setTimeout(() => {
           window.location.href =
             "https://webcat.hkpl.gov.hk/auth/logout?theme=WEB&locale=zh_TW";

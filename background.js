@@ -456,8 +456,107 @@ async function resetFlowFlagsForAccountRun() {
     runState: "running",
     runError: null,
     runDetails: null,
+    patronCheckoutStats: null,
     sessionEndedAt: null,
   });
+}
+
+function buildRenewSuccessDetails(stats) {
+  const n = stats?.renewableDueCount ?? stats?.checkedNow ?? 0;
+  if (n === 1) return "Success: renewed 1 item.";
+  if (n > 1) return `Success: renewed ${n} items.`;
+  return "Success: renewal completed.";
+}
+
+function buildLoanCheckoutAlerts(stats) {
+  const alerts = [];
+  if (!stats) return alerts;
+
+  const blocked = stats.blockedAttentionCount ?? 0;
+  if (blocked === 1) {
+    alerts.push({
+      type: "loan_blocked",
+      message: "1 book requires attention (cannot renew automatically).",
+    });
+  } else if (blocked > 1) {
+    alerts.push({
+      type: "loan_blocked",
+      message: `${blocked} books require attention (cannot renew automatically).`,
+    });
+  }
+
+  const notRenewed = stats.notRenewedCount ?? 0;
+  const nearestDate = stats.nearestExpiryDate;
+  const nearestCount = stats.nearestExpiryCount ?? 0;
+  if (notRenewed > 0 && nearestDate && nearestCount > 0) {
+    const bookLabel = nearestCount === 1 ? "book" : "books";
+    alerts.push({
+      type: "loan_nearest_expiry",
+      message: `${nearestCount} ${bookLabel} next due on ${nearestDate}.`,
+    });
+  }
+
+  return alerts;
+}
+
+async function attachLoanCheckoutAlerts(stats) {
+  const { currentAccountId, accountResults = {} } = await getState([
+    "currentAccountId",
+    "accountResults",
+  ]);
+  if (!currentAccountId || !stats) return;
+
+  const loanAlerts = buildLoanCheckoutAlerts(stats);
+  if (!loanAlerts.length) return;
+
+  const prev = accountResults[currentAccountId] ?? {
+    state: "running",
+    details: "",
+  };
+  const otherAlerts = (prev.alerts ?? []).filter(
+    (a) => a?.type !== "loan_blocked" && a?.type !== "loan_nearest_expiry",
+  );
+  accountResults[currentAccountId] = {
+    ...prev,
+    alerts: [
+      ...otherAlerts,
+      ...loanAlerts.map((a) => ({ ...a, detectedAt: Date.now() })),
+    ],
+  };
+  await setState({ accountResults });
+}
+
+function patronStatsFromMessage(message) {
+  return {
+    checkedNow: message.checkedNow ?? 0,
+    renewableDueCount: message.renewableDueCount ?? message.checkedNow ?? 0,
+    blockedAttentionCount: message.blockedAttentionCount ?? 0,
+    nearestExpiryDate: message.nearestExpiryDate ?? null,
+    nearestExpiryCount: message.nearestExpiryCount ?? 0,
+    notRenewedCount: message.notRenewedCount ?? 0,
+  };
+}
+
+function noRenewSuccessDetails(message, renewDaysBefore) {
+  const total = message.total ?? 0;
+  const displayOnlyLoanRows = !!message.displayOnlyLoanRows;
+  const blockedAttentionCount = message.blockedAttentionCount ?? 0;
+  const today = message.today ?? null;
+  const windowLabel =
+    renewDaysBefore === 0
+      ? "due today or overdue"
+      : `due within ${renewDaysBefore} day(s) or overdue`;
+
+  if (total === 0 && !displayOnlyLoanRows && blockedAttentionCount === 0) {
+    return "Success: no borrowed items found.";
+  }
+  if (blockedAttentionCount > 0 && (message.renewableDueCount ?? 0) === 0) {
+    return "Success: no items could be renewed automatically.";
+  }
+  if (today) {
+    return `Success: no items ${windowLabel} (${today}).`;
+  }
+  return `Success: no items ${windowLabel}.`;
 }
 
 /** Serialize tab creation so concurrent auto-run / queue starts never open duplicate login tabs. */
@@ -870,22 +969,27 @@ async function isAuthorizedPasswordExpiryTab(senderTabId) {
 }
 
 async function handleRenewResultSuccess(tabId) {
-  const { runState, runTabId, waitingForRenewResult } = await getState([
-    "runState",
-    "runTabId",
-    "waitingForRenewResult",
-  ]);
+  const { runState, runTabId, waitingForRenewResult, patronCheckoutStats } =
+    await getState([
+      "runState",
+      "runTabId",
+      "waitingForRenewResult",
+      "patronCheckoutStats",
+    ]);
   if (runState !== "running" || runTabId !== tabId || !waitingForRenewResult) {
     return false;
   }
 
   await clearPagePhaseAlarm(tabId);
 
+  const details = buildRenewSuccessDetails(patronCheckoutStats);
+  await attachLoanCheckoutAlerts(patronCheckoutStats);
+
   await chrome.storage.local.set({
     renewResultSeen: true,
     waitingForRenewResult: false,
     shouldLogout: true,
-    runDetails: "Success: renew result page opened.",
+    runDetails: details,
   });
 
   chrome.tabs
@@ -1119,6 +1223,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
           const checkedNow = message.checkedNow ?? 0;
           const total = message.total ?? 0;
+          const renewableDueCount =
+            message.renewableDueCount ?? checkedNow ?? 0;
           const today = message.today ?? null;
           const renewDaysBefore = [0, 1, 2, 3].includes(
             Number(message.renewDaysBefore),
@@ -1127,18 +1233,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             : 0;
           const didClickRenew = !!message.didClickRenew;
           const displayOnlyLoanRows = !!message.displayOnlyLoanRows;
+          const patronCheckoutStats = patronStatsFromMessage(message);
 
-          if (total === 0 || checkedNow === 0) {
-            const windowLabel =
-              renewDaysBefore === 0
-                ? "due today or overdue"
-                : `due within ${renewDaysBefore} day(s) or overdue`;
-            const details =
-              total === 0 && !displayOnlyLoanRows
-                ? "Success: no borrowed items found."
-                : today
-                  ? `Success: no items ${windowLabel} (${today}).`
-                  : `Success: no items ${windowLabel}.`;
+          await chrome.storage.local.set({ patronCheckoutStats });
+
+          if (total === 0 || renewableDueCount === 0) {
+            const details = noRenewSuccessDetails(message, renewDaysBefore);
+            await attachLoanCheckoutAlerts(patronCheckoutStats);
 
             await chrome.storage.local.set({
               runDetails: details,
@@ -1484,14 +1585,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (runState !== "running") return;
     if (runTabId !== tabId) return;
 
-    if (isRenewResultUrl(url)) {
-      const { waitingForRenewResult } = await chrome.storage.local.get([
-        "waitingForRenewResult",
-      ]);
-      if (!waitingForRenewResult) return;
-      await handleRenewResultSuccess(tabId);
-      return;
-    }
     if (url.startsWith(TARGET_AFTER_LOGIN)) {
       return;
     }

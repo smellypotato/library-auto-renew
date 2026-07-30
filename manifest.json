@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Library Auto Renew",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "description": "Logs into Hong Kong Public Library (HKPL) WebCat in your browser and renews loans due soon or overdue. Supports multiple saved accounts and a configurable renew window.",
   "icons": {
     "16": "icons/icon16.png",
@@ -58,7 +58,10 @@
     },
     {
       "matches": ["https://webcat.hkpl.gov.hk/wicket/page?*"],
-      "js": ["webcat-renew-result-content.js"],
+      "js": [
+        "webcat-renew-confirm-content.js",
+        "webcat-renew-result-content.js"
+      ],
       "run_at": "document_idle"
     }
   ]
